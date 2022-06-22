@@ -1,0 +1,36 @@
+[package]
+name = "waterci-core"
+version = "0.1.0+alpha.2"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "waterci_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "waterci-core"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "~1.0.57"
+waterlib = { git="https://github.com/WaterCI/waterlib" }
+serde = { version = "~1.0.137", features = ["derive"] }
+serde_yaml = { version = "~0.8.24" }
+rmp-serde = "~1.1.0"
+mio = "~0.8.3"
+clap = { version = "~3.1.18", features = ["derive"], optional = true }
+sentry = { version = "~0.26.0", features = ["backtrace", "contexts", "panic", "transport", "anyhow", "tracing"], optional = true }
+tracing = { version = "~0.1.35", features = ["log"], optional = true }
+tracing-subscriber = { version = "~0.3.11", features = ["env-filter"], optional = true }
+sentry-tracing = { version = "~0.26.0", optional = true }
+
+[dev-dependencies]
+pretty_assertions = "1.2"
+ntest = "0.8"
+
+[features]
+tracing-logs = ["tracing", "tracing-subscriber"]
+sentry-integration = ["sentry", "sentry-tracing", "tracing-logs"]
+default = ["clap", "sentry-integration", "tracing-logs"]
