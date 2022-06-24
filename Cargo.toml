@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "~1.0.57"
-waterlib = { git="https://github.com/WaterCI/waterlib" }
+waterlib = { git="https://github.com/WaterCI/waterlib", branch="main"}
 serde = { version = "~1.0.137", features = ["derive"] }
 serde_yaml = { version = "~0.8.24" }
 rmp-serde = "~1.1.0"

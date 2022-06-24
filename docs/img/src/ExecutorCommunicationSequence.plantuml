@@ -1,0 +1,29 @@
+@startuml
+title Core Communications
+collections incoming
+control core
+collections executors
+core <-- executors: TCP connect
+note right: All executor/core\ncommunication is via MsgPack
+== Executor Registration ==
+core <- executors: ExecutorMessage::ExecutorRegister
+core -> executors: ExecutorMessage::ExecutorRegisterResponse(uuid)
+== Build Request from VCS client ==
+incoming -> core: IncomingMessage::BuildRequestFromRepo(\n  BuildRequestFromRepo\n)
+note left: all incoming/core\nmsgs are in YAML
+note right: Build request is stored in internal queue
+group Executor Build Request
+core -> executors: ExecutorMessage::ExecutorStatusQuery
+note right: ensures executor status
+core <- executors: ExecutorMessage::ExecutorStatusResponse
+note right: send build request over…
+core -> executors: ExecutorMessage::BuildRequest(BuildRequestFromRepo)
+core -> executors: ExecutorMessage::ExecutorStatusQuery
+note right: ask status again,\nin case executor can build more stuff
+core <- executors: ExecutorMessage::ExecutorStatusResponse
+hnote over executors: Executes the build request
+executors -> executors: //executes the build request…
+core <- executors: ExecutorMessage::JobBuildResult(JobBuildResult) 1
+core <- executors: ExecutorMessage::JobBuildResult(JobBuildResult) n
+end
+@enduml
