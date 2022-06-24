@@ -1,20 +1,21 @@
-use crate::Config;
-use anyhow::{Error, Result};
-use mio::event::Event;
-use mio::net::{TcpListener, TcpStream};
-use mio::{Events, Interest, Poll, Registry, Token};
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind::{Interrupted, WouldBlock, WriteZero};
 use std::io::{Read, Write};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 use std::{io, thread};
-use tracing::{debug, error, event, info, trace};
+
+use anyhow::{Error, Result};
+use mio::net::{TcpListener, TcpStream};
+use mio::{Events, Interest, Poll, Registry, Token};
+use tracing::{debug, error, info, trace};
 use tracing::{instrument, warn};
-use waterlib::net::ExecutorMessage::ExecutorRegisterResponse;
-use waterlib::net::ExecutorStatus::{Available, Running, YetToRegister};
+use waterlib::net::ExecutorMessage::{BuildRequest, ExecutorRegisterResponse, ExecutorStatusQuery};
+use waterlib::net::ExecutorStatus::{Available, YetToRegister};
 use waterlib::net::{BuildRequestFromRepo, ExecutorMessage, ExecutorStatus, IncomingMessage};
 use waterlib::utils::gen_uuid;
+
+use crate::Config;
 
 const INCOMING_SERVER: Token = Token(0);
 const EXECUTOR_SERVER: Token = Token(1);
@@ -31,8 +32,33 @@ struct Executor {
     id: Option<String>,
     status: ExecutorStatus,
     stream: TcpStream,
+    token: Token,
+    pending_msgs: VecDeque<ExecutorMessage>,
 }
+
+impl Executor {
+    fn queue_message(&mut self, message: ExecutorMessage, registry: &Registry) -> Result<()> {
+        if let BuildRequest(_) = message {
+            self.pending_msgs.push_back(ExecutorStatusQuery);
+        }
+        self.pending_msgs.push_back(message);
+        registry.reregister(&mut self.stream, self.token, Interest::WRITABLE)?;
+        Ok(())
+    }
+    fn send_pending_message(&mut self) -> Result<()> {
+        if let Some(msg) = self.pending_msgs.pop_front() {
+            msg.write(&self.stream)?;
+        }
+        Ok(())
+    }
+    fn reregister(&mut self, registry: &Registry, interests: Interest) -> Result<()> {
+        registry.reregister(&mut self.stream, self.token, interests)?;
+        Ok(())
+    }
+}
+
 type JobQueue = VecDeque<BuildRequestFromRepo>;
+
 #[instrument]
 pub fn run(config: &Config, should_stop_rx: Receiver<bool>) -> Result<()> {
     let mut queue = JobQueue::with_capacity(128);
@@ -116,8 +142,10 @@ pub fn run(config: &Config, should_stop_rx: Receiver<bool>) -> Result<()> {
                         token,
                         Executor {
                             id: None,
-                            status: ExecutorStatus::YetToRegister,
+                            status: YetToRegister,
                             stream: connection,
+                            token: token,
+                            pending_msgs: VecDeque::new(),
                         },
                     );
                 },
@@ -149,18 +177,73 @@ pub fn run(config: &Config, should_stop_rx: Receiver<bool>) -> Result<()> {
                             //todo!("Handle incoming message event");
                         }
                     } else if let Some(executor) = executor_connections.get_mut(&token) {
-                        if event.is_writable() {
-                            debug!("executor {:?} is writable", executor.id);
-                            match handle_write_executor_message(
-                                poll.registry(),
-                                executor,
-                                &mut queue,
-                                event,
-                            ) {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    error!("{e}");
-                                    todo!("Handle error");
+                        if event.is_writable() && executor.pending_msgs.len() > 0 {
+                            debug!(
+                                "executor {:?} is writable and has items to send",
+                                executor.id
+                            );
+
+                            let msg = executor.pending_msgs.pop_front().unwrap();
+                            match msg {
+                                ExecutorMessage::BuildRequest(_) => {
+                                    if executor.status != Available {
+                                        // then we need to push it back in front of the queue
+                                        if let BuildRequest(brfr) = msg {
+                                            queue.push_front(brfr);
+                                            continue;
+                                        }
+                                    }
+                                    match handle_write_executor_message(&mut executor.stream, &msg)
+                                    {
+                                        Ok(_) => {
+                                            executor.queue_message(
+                                                ExecutorStatusQuery,
+                                                poll.registry(),
+                                            )?;
+                                        }
+                                        Err(e) => {
+                                            error!("{e}");
+                                            todo!("Handle error");
+                                        }
+                                    };
+                                }
+                                ExecutorRegisterResponse { .. } => {
+                                    match handle_write_executor_message(&mut executor.stream, &msg)
+                                    {
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            error!("{e}");
+                                            todo!("Handle error");
+                                        }
+                                    };
+                                }
+                                ExecutorStatusQuery => {
+                                    match handle_write_executor_message(&mut executor.stream, &msg)
+                                    {
+                                        Ok(_) => {
+                                            executor
+                                                .reregister(poll.registry(), Interest::READABLE)?;
+                                        }
+                                        Err(e) => {
+                                            error!("{e}");
+                                            todo!("Handle error");
+                                        }
+                                    };
+                                }
+                                ExecutorMessage::CloseConnection(_) => {
+                                    match handle_write_executor_message(&mut executor.stream, &msg)
+                                    {
+                                        Ok(_) => {
+                                            has_closed_connection = true;
+                                        }
+                                        Err(e) => {
+                                            error!("{e}");
+                                            todo!("Handle error");
+                                        }
+                                    };
+                                }
+                                _ => {
+                                    panic!("Invalid message was asked to be sent: {msg:?}");
                                 }
                             };
                         }
@@ -170,24 +253,27 @@ pub fn run(config: &Config, should_stop_rx: Receiver<bool>) -> Result<()> {
                                     ExecutorMessage::JobResult(job_result) => {
                                         info!("Got back {:?}", job_result);
                                         warn!("For now, all JobResults are discarded");
+                                        poll.registry().reregister(
+                                            &mut executor.stream,
+                                            token,
+                                            Interest::READABLE,
+                                        )?;
                                     }
                                     ExecutorMessage::ExecutorRegister => {
                                         if executor.status == YetToRegister {
                                             // then, schedule the response to be sent
-                                            poll.registry().reregister(
-                                                &mut executor.stream,
-                                                token,
-                                                Interest::WRITABLE,
+                                            let id = gen_uuid();
+                                            executor.queue_message(
+                                                ExecutorRegisterResponse { id: id.clone() },
+                                                poll.registry(),
                                             )?;
+                                            executor.id = Some(id);
+                                            executor.status = Available;
                                         }
                                     }
                                     ExecutorMessage::ExecutorStatusResponse(status) => {
                                         executor.status = status;
-                                        poll.registry().reregister(
-                                            &mut executor.stream,
-                                            token,
-                                            Interest::WRITABLE | Interest::READABLE,
-                                        )?;
+                                        executor.reregister(poll.registry(), Interest::READABLE)?;
                                     }
                                     ExecutorMessage::CloseConnection(_id) => {
                                         has_closed_connection = true;
@@ -224,9 +310,23 @@ pub fn run(config: &Config, should_stop_rx: Receiver<bool>) -> Result<()> {
             }
             thread::sleep(Duration::from_micros(1_000));
         }
+        // Here we will attempt to unqueue the jobs and dispatch them
+
+        for (_token, executor) in executor_connections.iter_mut() {
+            if executor.pending_msgs.len() > 0 {
+                executor.reregister(poll.registry(), Interest::WRITABLE)?;
+            }
+            if queue.len() > 0 && executor.status == Available {
+                debug!("found available executor {:?}", executor.id);
+                if let Some(brfr) = queue.pop_front() {
+                    executor.queue_message(BuildRequest(brfr), poll.registry())?;
+                }
+            }
+        }
     }
     Ok(())
 }
+
 #[instrument]
 /// Returns Some(IncomingMessage) if we could read, None if connection is closed or whatever
 fn handle_incoming_read_event(connection: &mut TcpStream) -> Result<Option<IncomingMessage>> {
@@ -315,61 +415,26 @@ fn handle_executor_read_event(connection: &mut TcpStream) -> Result<Option<Execu
     // If here we don't have anything to send back, let's assume the connection is closed
     return Ok(None);
 }
+
 #[instrument]
-fn handle_write_executor_message(
-    registry: &Registry,
-    executor: &mut Executor,
-    queue: &mut JobQueue,
-    event: &Event,
-) -> Result<()> {
-    if let Some(msg) = match &executor.status {
-        YetToRegister if executor.id.is_none() => {
-            let id = gen_uuid();
-            executor.id = Some(id.clone());
-            executor.status = Available;
-            Some(ExecutorRegisterResponse { id })
+fn handle_write_executor_message(stream: &mut TcpStream, msg: &ExecutorMessage) -> Result<()> {
+    debug!("We'll write {msg:?} to executor");
+    let mut buffer = Vec::new();
+    msg.write(&mut buffer)?;
+    match stream.write(&buffer) {
+        Ok(n) if n < buffer.len() => return Err(Error::from(io::Error::from(WriteZero))),
+        Ok(_) => {
+            // we have successfully wrote
+            // TODO: have a next_message: Some(ExecutorMessage) that we would check in the mainloop to register the socket as writable
+            //trace!("Reregistering executor as READABLE…");
         }
-        YetToRegister => None,
-        Available if !queue.is_empty() => {
-            let id = executor.id.as_ref().unwrap();
-            info!("Found executor {:?} available & queue is not empty", id);
-            if let Some(msg) = queue.pop_front() {
-                // let's switch to the mode where we want to read the JobResult
-                info!("Sending {msg:?} to {:?}", id);
-                registry.reregister(&mut executor.stream, event.token(), Interest::READABLE)?;
-                executor.status = Running;
-                Some(ExecutorMessage::BuildRequest(msg))
-            } else {
-                None
-            }
+        Err(e) if e.kind() == WouldBlock => {
+            // stream not really ready to perform I/O
         }
-        Available => None,
-        Running => None,
-    } {
-        debug!("We'll write {msg:?} to executor");
-        let mut buffer = Vec::new();
-        msg.write(&mut buffer)?;
-        match executor.stream.write(&buffer) {
-            Ok(n) if n < buffer.len() => return Err(Error::from(io::Error::from(WriteZero))),
-            Ok(_) => {
-                // we have successfully wrote
-                // TODO: have a next_message: Some(ExecutorMessage) that we would check in the mainloop to register the socket as writable
-                //trace!("Reregistering executor as READABLE…");
-            }
-            Err(e) if e.kind() == WouldBlock => {
-                // stream not really ready to perform I/O
-            }
-            Err(e) if e.kind() == Interrupted => {
-                todo!("we should re-attempt to send it");
-            }
-            Err(e) => return Err(Error::from(e)),
+        Err(e) if e.kind() == Interrupted => {
+            todo!("we should re-attempt to send it");
         }
+        Err(e) => return Err(Error::from(e)),
     }
-    trace!("Reregistering executor as READABLE|WRITABLE");
-    registry.reregister(
-        &mut executor.stream,
-        event.token(),
-        Interest::WRITABLE | Interest::READABLE,
-    )?;
     Ok(())
 }

@@ -1,5 +1,5 @@
 use ntest::timeout;
-use pretty_assertions::{assert_eq, assert_ne};
+use pretty_assertions::assert_eq;
 use std::borrow::Cow;
 use std::net::TcpStream;
 use std::sync::mpsc::{channel, Sender};
@@ -13,6 +13,8 @@ use tracing_subscriber::{fmt, EnvFilter};
 use waterci_core::core::run;
 use waterci_core::Config;
 use waterlib::config::{JobConfig, RepositoryConfig};
+use waterlib::net::ExecutorMessage::ExecutorStatusResponse;
+use waterlib::net::ExecutorStatus::{Available, Busy};
 use waterlib::net::{BuildRequestFromRepo, ExecutorMessage, IncomingMessage};
 
 fn launch_core(config: Config) -> (JoinHandle<()>, Sender<bool>) {
@@ -107,6 +109,17 @@ fn test_simple_br() {
     IncomingMessage::BuildRequestFromRepo(payload.clone())
         .write(incoming_stream)
         .expect("could not send incoming payload");
+    info!("Waiting for ExecutorStatusQuery");
+    if let ExecutorMessage::ExecutorStatusQuery =
+        ExecutorMessage::from(&mut executor_stream).expect("Could not deserialize ExecutorMessage")
+    {
+        info!("Got ExecutorStatusQuery! Signaling ourselves as available.");
+        ExecutorStatusResponse(Available)
+            .write(&mut executor_stream)
+            .unwrap();
+    } else {
+        panic!();
+    }
 
     info!("Waiting for build request to arrive…");
     let br =
@@ -118,6 +131,17 @@ fn test_simple_br() {
         _ => {
             panic!("Got unexpected message: {br:?}");
         }
+    }
+
+    info!("Waiting for ExecutorStatusQuery, part 2");
+    if let ExecutorMessage::ExecutorStatusQuery =
+        ExecutorMessage::from(&mut executor_stream).expect("Could not deserialize ExecutorMessage")
+    {
+        ExecutorStatusResponse(Busy)
+            .write(&mut executor_stream)
+            .unwrap();
+    } else {
+        panic!();
     }
 
     should_stop_tx
